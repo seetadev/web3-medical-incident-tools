@@ -1,0 +1,139 @@
+name: Claude AI Comment Organizer
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  claude-organize:
+    runs-on: ubuntu-latest
+    # Only run if the comment contains "/claude-organize"
+    if: contains(github.event.comment.body, '/claude-organize')
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install boto3 requests
+
+      - name: Organize comment with Claude
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AWS_BEDROCK_MODEL_ID: ${{ secrets.AWS_BEDROCK_MODEL_ID }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_URL: ${{ github.event.comment.html_url }}
+        run: |
+          cat << 'EOF' > claude_organize.py
+          import boto3
+          import json
+          import os
+          import requests
+          import re
+
+          def get_bedrock_client():
+              return boto3.client('bedrock-runtime', region_name=os.environ['AWS_DEFAULT_REGION'])
+
+          def organize_with_claude(comment_text):
+              client = get_bedrock_client()
+              
+              # Remove the /claude-organize trigger from the comment
+              cleaned_comment = re.sub(r'/claude-organize\s*', '', comment_text, flags=re.IGNORECASE).strip()
+              
+              if not cleaned_comment:
+                  return "No content to organize after removing the /claude-organize command."
+              
+              prompt = f"""
+          You are an expert at organizing and structuring text content. Please take the following comment and reorganize it into a clear, well-structured format with proper bullet points and organization.
+
+          Original comment:
+          ```
+          {cleaned_comment}
+          ```
+
+          Please reorganize this content following these guidelines:
+          1. Create clear sections with appropriate headings if the content covers multiple topics
+          2. Use bullet points and sub-bullets for better readability
+          3. Group related information together
+          4. Maintain all the original information - don't add or remove content
+          5. Use proper markdown formatting
+          6. If there are action items, group them together
+          7. If there are questions, group them together
+          8. Make the structure logical and easy to follow
+
+          Return only the organized content without any explanatory text about what you did.
+          """
+
+              body = {
+                  "anthropic_version": "bedrock-2023-05-31",
+                  "max_tokens": 4000,
+                  "messages": [
+                      {
+                          "role": "user",
+                          "content": prompt
+                      }
+                  ]
+              }
+              
+              response = client.invoke_model(
+                  body=json.dumps(body),
+                  modelId=os.environ.get('AWS_BEDROCK_MODEL_ID', 'anthropic.claude-3-sonnet-20240229-v1:0'),
+                  accept='application/json',
+                  contentType='application/json'
+              )
+              
+              response_body = json.loads(response.get('body').read())
+              return response_body['content'][0]['text']
+
+          def update_original_comment(organized_content, comment_id):
+              github_token = os.environ['GITHUB_TOKEN']
+              repo = os.environ['GITHUB_REPOSITORY']
+              
+              headers = {
+                  'Authorization': f'token {github_token}',
+                  'Accept': 'application/vnd.github.v3+json'
+              }
+              
+              # Update the original comment with the organized content only
+              url = f'https://api.github.com/repos/{repo}/issues/comments/{comment_id}'
+              response = requests.patch(url, headers=headers, json={'body': organized_content})
+              
+              if response.status_code == 200:
+                  print("✅ Original comment updated successfully")
+              else:
+                  print(f"❌ Failed to update comment: {response.status_code}")
+                  print(response.text)
+
+          def main():
+              comment_body = os.environ['COMMENT_BODY']
+              comment_id = os.environ['COMMENT_ID']
+              
+              print("🔍 Organizing comment with Claude...")
+              organized_content = organize_with_claude(comment_body)
+              
+              print("📝 Updating original comment...")
+              update_original_comment(organized_content, comment_id)
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+          python claude_organize.py
